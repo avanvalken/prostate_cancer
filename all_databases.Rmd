@@ -1,0 +1,3318 @@
+---
+title: "Prostate Cancer"
+author: "avanvalken"
+date: "9/7/2020"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    theme: "flatly"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE,include=FALSE}
+suppressPackageStartupMessages({
+# cBioPortalData relies on R 4.0.2
+#BiocManager::install("cBioPortalData")
+library(cBioPortalData)
+library(MultiAssayExperiment)
+#BiocManager::install("TBSignatureProfiler")
+library(TBSignatureProfiler)
+library(GenomicRanges)
+library(SummarizedExperiment)
+library(RaggedExperiment)
+library(BiocGenerics)
+#BiocManager::install("singleCellTK")
+library(singleCellTK)
+library(sva)
+library(tidyverse)
+library(data.table)})
+library(DESeq2)
+library(edgeR)
+library(DT)
+library(ComplexHeatmap)
+library(corrplot)
+library(plyr)
+library(ggplot2)
+library(reshape2)
+library(Rtsne)
+library(umap)
+
+knitr::opts_chunk$set(cache = TRUE)
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+# Load data
+```{r, include=FALSE}
+
+# Read SummarizedExperiments from file
+prad_tcga <- readRDS("prad_tcga_SE.RDS")
+#su2c dataset in rpkm
+su2c_2015 <- readRDS("su2c_2015_SE.RDS")
+##dkfz dataset in rpkm
+dkfz_se <- readRDS("dkfz_se.RDS")
+
+# Separate old and young SU2c data; 11 young (AGE<55); 103 old 
+indata <- su2c_2015[,!is.na(colData(su2c_2015)$AGE_CLASS)]
+su2c_young <- indata[,colData(indata)$AGE_CLASS=="YOUNG" ]
+su2c_old <- indata[,colData(indata)$AGE_CLASS=="OLD"]
+
+# Separate old and young tcga data; 11 young (AGE<55); 103 old 
+indata <- prad_tcga[,!is.na(colData(prad_tcga)$Age )]
+tcga_young <- indata[,colData(indata)$Age <= 55 ]
+tcga_old <- indata[,colData(indata)$Age > 55]
+```
+
+
+# Histograms of data {.tabset}
+The purpose of this is to determine if the spread looks alright. Genes with less than 20% variance have already been removed.
+The "counts" histograms only had one large peak near zero. 
+
+## TCGA histogram
+```{r}
+
+hist(assay(prad_tcga, "log_counts"), breaks = 100)
+
+```
+
+## DKFZ histogram
+```{r}
+hist(assay(dkfz_se, "log_counts"), breaks = 100)
+```
+
+## SU2C histogram
+```{r}
+hist(assay(su2c_2015, "log_counts"), breaks = 100)
+```
+
+## Functions
+A list of functions used to make coding easier. 
+```{r}
+
+prCancer_sigs <- readRDS("prCancer_sigs.RDS")
+
+genelist <- c("BCL2L1", "PIK3CA", "AKT1", "RASA1", "SRC", "STAT3", "PDK1", "MYC")
+
+
+#function to analyze correlations between a gene and selected genes. 
+gene_cor <- function(indata, genelist, main_gene = "PTEN",  method = "spearman", indata_assay = "log_cpm"){
+  #matrix of gene data
+  mat <- as.data.frame(t(assay(indata, "log_cpm")))
+  
+  df <- data.frame( )
+  output <- list()
+  
+  #get correlations between main_gene and other genes
+  for(i in genelist){ 
+    output[[i]] <- cor.test(x=mat[,main_gene], y=mat[,i], method = method)
+  }
+  
+  #df <- as.data.frame(unlist(output$BCL2L1))
+  df <- as.data.frame(t(ldply(output, unlist)))
+  colnames(df) <- df[1,]
+  df <- df[2:4,]
+}
+
+#rm(mat_values, output, df, mat)
+
+# Function to plot gene signatures coefficient correlation matrix
+pten_plot <- function(indata, p_sig = prCancer_sigs, main_gene = "PTEN"){ 
+  p_sigs <- lapply(p_sig, append, main_gene)
+  for (i in names(p_sigs)){
+  
+  cat("###", i, "\n")
+  
+  #list of signature genes in a usable form
+  #only use genes recognized by what we have
+  p_sigl <- unlist(p_sigs[i])
+  p_sigs_keep <- (which(p_sigl %in% rownames(assay(indata,"log_cpm"))))
+ 
+  cor_genes <- p_sigl[p_sigs_keep]
+  
+  #make gene list for correlations
+  pmat <- as.matrix(assay(indata[(cor_genes),],"log_cpm"))
+  pmat = t(scale(t(pmat)))
+  
+  #make and plot correlation matrix
+  cr <- cor(t(as.matrix(pmat)))
+  corrplot(cr, order = "AOE", method = "color", tl.cex = 0.5)
+
+  cat("\n\n")
+}}
+
+#rm(cor_genes, main_gene, method, p_sigl, p_sigs_keep, pmat, p_sigs, cr)
+#median absolute value of matrix or vector x
+mav <- function(x){
+  median(abs(x))
+}
+
+
+# function to get median absolute value of a correlation coef for pten
+pten_coef <- function(indata, p_sig = prCancer_sigs, main_gene = "PTEN"){
+  l <- list()
+  p_sigs <- lapply(p_sig, append, main_gene)
+  for (i in names(p_sigs)){
+  #cat("###", i, "\n")
+  
+  #list of signature genes in a usable form
+  #only use genes recognized by what we have
+  p_sigl <- unlist(p_sigs[i])
+  p_sigs_keep <- (which(p_sigl %in% rownames(assay(indata,"log_cpm"))))
+ 
+  cor_genes <- p_sigl[p_sigs_keep]
+  
+  #make gene list for correlations
+  pmat <- as.matrix(assay(indata[(cor_genes),],"log_cpm"))
+  pmat = t(scale(t(pmat)))
+  
+  #make and plot correlation matrix
+  cr <- as.data.frame(cor(t(as.matrix(pmat))))
+  
+  cr_mav <- mav(cr$PTEN)
+  #append cr matrix to l list
+  l <- unlist(list(l, list(cr_mav)), recursive=FALSE)
+  }
+  names(l) <- names(p_sigs)
+  
+  return(l)
+}
+
+# a function to use permutations on data for signatures
+sig_coeflist <- function(prlist, matrix=mat){
+  # list of 1000 replicates of random genes
+  randlist <- replicate(1000, simplify=FALSE, {sample(rownames(mat), size = length(prlist ))})
+
+  # add pten to each list in randlist
+  randlist <- lapply(randlist, append, "PTEN")
+  # list of coeficients for pten and all the genes in the randlist
+  listmat <- list()
+    for (i in seq_along(randlist)){
+    listmat[[i]] <- (cor(scale(t(mat[unlist(randlist[i]),]))))
+    }
+  # subset only pten coefficients
+  listpten <- list()
+    for (i in seq_along(listmat)){
+      listpten[[i]] <- listmat[[i]][,"PTEN"]
+    }
+  # pten median absolute values of each in list
+  sig_coef <- map(listpten, mav)
+  sig_coef
+
+  ## pten median absolute value of original signature
+  
+  p_sigl <- unlist(prlist)
+  p_sigs_keep <- which(p_sigl %in% rownames(mat))
+ 
+  cor_genes <- p_sigl[p_sigs_keep]
+  cor_genes <- c(cor_genes, "PTEN")
+  
+  #make gene list for correlations
+  pmat <- mat[cor_genes,]
+  pmat = as.data.frame(cor(scale(t(pmat))))
+  
+ 
+  cr_mav <- mav(pmat$PTEN)
+  
+  
+  # p values of prCancer_sigs
+  p_val <- mean(sig_coef > cr_mav)
+  p_val
+
+}
+
+#mmmmm <- pten_coef(indata)
+#df <- as.data.frame(t(ldply(mmmmm, unlist)))
+```
+
+
+# Correlation between selected genes {.tabset}
+## TCGA {.tabset}
+### TCGA Spearman Coefficient Table
+Within the TCGA dataset there are a wide range of ages. (~68<55; ~250>55)
+```{r}
+spearman_coef_pten_tcga <- gene_cor(prad_tcga, genelist)
+datatable(spearman_coef_pten_tcga, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+```
+
+### TCGA Gene Plots
+```{r}
+indata <- prad_tcga
+genelist <- c(genelist, "PTEN")
+genelist <- as.character(genelist)
+  mat <- as.data.frame(t(assay(indata[genelist,], "log_cpm")))
+  df <- melt(mat)
+  
+ggplot(data=df, mapping=aes(x=variable, y=value)) +
+  geom_violin() +
+  geom_point(alpha=0.1) +
+  geom_jitter()
+
+
+```
+
+
+
+
+
+### pten coef for signatures with p values from sampling
+```{r}
+
+indata <- prad_tcga
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+unlist(pval)
+```
+
+
+## TCGA Young {.tabset}
+### TCGA Spearman Coefficient Table
+```{r}
+spearman_coef_pten_tcga <- gene_cor(tcga_young, genelist)
+datatable(spearman_coef_pten_tcga, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+```
+
+### TCGA Gene Plots
+```{r}
+indata <- tcga_young
+genelist <- c(genelist, "PTEN")
+genelist <- as.character(genelist)
+  mat <- as.data.frame(t(assay(indata[genelist,], "log_cpm")))
+  df <- melt(mat)
+  
+ggplot(data=df, mapping=aes(x=variable, y=value)) +
+  geom_violin() +
+  geom_point(alpha=0.1) +
+  geom_jitter()
+
+
+```
+
+
+
+
+
+
+### pten coef for signatures with p values from sampling
+```{r}
+
+indata <- tcga_young
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+unlist(pval)
+```
+
+
+## TCGA Old {.tabset}
+### TCGA Spearman Coefficient Table
+```{r}
+spearman_coef_pten_tcga <- gene_cor(tcga_old, genelist)
+datatable(spearman_coef_pten_tcga, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+```
+
+### TCGA Gene Plots
+```{r}
+indata <- tcga_old
+genelist <- c(genelist, "PTEN")
+genelist <- as.character(genelist)
+  mat <- as.data.frame(t(assay(indata[genelist,], "log_cpm")))
+  df <- melt(mat)
+  
+ggplot(data=df, mapping=aes(x=variable, y=value)) +
+  geom_violin() +
+  geom_point(alpha=0.1) +
+  geom_jitter()
+
+
+```
+
+
+
+
+
+
+
+### pten coef for signatures with p values from sampling
+```{r}
+
+indata <- tcga_old
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+unlist(pval)
+```
+
+
+## DKFZ {.tabset}
+### DKFZ Spearman Coefficient Table 
+No one is older than 52 at the age of diagnosis in the DKFZ dataset
+```{r}
+spearman_coef_pten_dkfz <- gene_cor(dkfz_se, genelist)
+datatable(spearman_coef_pten_dkfz, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+# df <- as.data.frame(spearman_coef_pten_dkfz)
+# library(sjPlot)
+# tab_df(df,
+#        title="Table 1. Spearman Correlation Coefficients of PTEN vs Select Genes.",
+#        alternate.rows = TRUE,
+#        digits = 3,
+#        file = "dkfz_coef.doc")
+
+```
+
+### DKFZ Gene Plots
+```{r}
+indata <- dkfz_se
+genelist$PTEN <- "PTEN"
+genelist <- as.character(genelist)
+  mat <- as.data.frame(t(assay(indata[genelist,], "log_cpm")))
+  df <- melt(mat)
+  
+ggplot(data=df, mapping=aes(x=variable, y=value)) +
+  geom_violin() +
+  geom_point(alpha=0.1) +
+  geom_jitter()
+
+
+```
+
+
+
+### pten coef for signatures with p values from sampling
+```{r}
+
+indata <- dkfz_se
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+dfkz_pval <- as.data.frame(unlist(pval))
+
+names(df) <- "pval"
+
+# names(df_coef) <- "coef"
+# 
+# df <- cbind(df_coef, df)
+# 
+# tab_df(df,
+#        title="Table 2. Spearman Correlation Coefficients of PTEN vs Cancer Signauture Genes.",
+#        alternate.rows = TRUE,
+#        digits = 3,
+#        file = "dkfz_coef_pval.doc")
+
+```
+
+
+## SU2C {.tabset}
+
+### SU2C Spearman Coefficient Table 
+```{r}
+spearman_coef_pten_su2c <- gene_cor(su2c_2015, genelist)
+
+datatable(spearman_coef_pten_su2c, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+```
+
+
+### SU2C Gene Plots
+```{r}
+indata <- su2c_2015
+genelist$PTEN <- "PTEN"
+genelist <- as.character(genelist)
+  mat <- as.data.frame(t(assay(indata[genelist,], "log_cpm")))
+  df <- melt(mat)
+  
+ggplot(data=df, mapping=aes(x=variable, y=value)) +
+  geom_violin() +
+  geom_point(alpha=0.1) +
+  geom_jitter()
+
+
+```
+
+
+### pten coef for signatures with p values from sampling
+```{r}
+
+indata <- su2c_2015
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+unlist(pval)
+```
+
+## SU2C_young {.tabset}
+### SU2C_young Spearman Coefficient Table
+There are only 11 individuals in the SU2C with AGE<55. 
+```{r}
+spearman_coef_pten_su2c <- gene_cor(su2c_young, genelist)
+
+datatable(spearman_coef_pten_su2c, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+```
+
+### SU2C_young Gene Plots
+```{r}
+indata <- su2c_young
+genelist$PTEN <- "PTEN"
+genelist <- as.character(genelist)
+  mat <- as.data.frame(t(assay(indata[genelist,], "log_cpm")))
+  df <- melt(mat)
+  
+ggplot(data=df, mapping=aes(x=variable, y=value)) +
+  geom_violin() +
+  geom_point(alpha=0.1) +
+  geom_jitter()
+
+
+```
+
+
+### pten coef for signatures with p values from sampling
+```{r}
+
+indata <- su2c_young
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+unlist(pval)
+```
+
+## SU2C_old {.tabset}
+### SU2C_old Spearman Coefficient Table
+```{r}
+spearman_coef_pten_su2c <- gene_cor(su2c_old, genelist)
+
+datatable(spearman_coef_pten_su2c, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+```
+### SU2C_old Gene Plots
+```{r}
+indata <- su2c_old
+genelist$PTEN <- "PTEN"
+genelist <- as.character(genelist)
+  mat <- as.data.frame(t(assay(indata[genelist,], "log_cpm")))
+  df <- melt(mat)
+  
+ggplot(data=df, mapping=aes(x=variable, y=value)) +
+  geom_violin() +
+  geom_point(alpha=0.1) +
+  geom_jitter()
+
+
+```
+
+### pten coef for signatures with p values from sampling
+```{r}
+
+indata <- su2c_old
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+unlist(pval)
+```
+
+# Plotting the correlation matrix with cancer signatures and PTEN {.tabset}
+
+Plots of correlations between PTEN and other genes in each signature organized by Eigenvalues. Also printed the median of the absolute value of the coefficients. 
+
+## TCGA correlation matrix {.tabset}
+### Median of absolute values
+```{r}
+indata <- prad_tcga
+
+
+df_coef <- as.data.frame(unlist(pten_coef(indata)))
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+df <- as.data.frame(unlist(pval))
+
+names(df) <- "pval"
+
+names(df_coef) <- "coef"
+
+df <- cbind(df_coef, df)
+
+datatable(df, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+# tab_df(df,
+#        title="Table 2. Spearman Correlation Coefficients of PTEN vs Cancer Signature Genes.",
+#        alternate.rows = TRUE,
+#        digits = 3,
+#        file = "dkfz_coef_pval.doc")
+
+```
+
+
+### Plots {.tabset}
+```{r}
+pten_plot(indata)
+```
+
+
+
+## TCGA_young correlation matrix {.tabset}
+### Median of absolute values
+```{r}
+indata <- tcga_young
+
+
+df_coef <- as.data.frame(unlist(pten_coef(indata)))
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+df <- as.data.frame(unlist(pval))
+
+names(df) <- "pval"
+
+names(df_coef) <- "coef"
+
+df <- cbind(df_coef, df)
+
+datatable(df, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+# tab_df(df,
+#        title="Table 2. Spearman Correlation Coefficients of PTEN vs Cancer Signature Genes.",
+#        alternate.rows = TRUE,
+#        digits = 3,
+#        file = "dkfz_coef_pval.doc")
+
+```
+
+
+### Plots {.tabset}
+```{r}
+pten_plot(indata)
+```
+
+## TCGA_old correlation matrix {.tabset}
+### Median of absolute values
+```{r}
+indata <- tcga_old
+
+
+df_coef <- as.data.frame(unlist(pten_coef(indata)))
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+df <- as.data.frame(unlist(pval))
+
+names(df) <- "pval"
+
+names(df_coef) <- "coef"
+
+df <- cbind(df_coef, df)
+
+datatable(df, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+# tab_df(df,
+#        title="Table 2. Spearman Correlation Coefficients of PTEN vs Cancer Signature Genes.",
+#        alternate.rows = TRUE,
+#        digits = 3,
+#        file = "dkfz_coef_pval.doc")
+
+```
+
+
+### Plots {.tabset}
+```{r}
+pten_plot(indata)
+```
+
+
+
+## DKFZ correlation matrix {.tabset}
+### Median of absolute values
+```{r}
+indata <- dkfz_se
+
+
+df_coef <- as.data.frame(unlist(pten_coef(indata)))
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+df <- as.data.frame(unlist(pval))
+
+names(df) <- "pval"
+
+names(df_coef) <- "coef"
+
+df <- cbind(df_coef, df)
+
+datatable(df, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+# tab_df(df,
+#        title="Table 2. Spearman Correlation Coefficients of PTEN vs Cancer Signature Genes.",
+#        alternate.rows = TRUE,
+#        digits = 3,
+#        file = "dkfz_coef_pval.doc")
+
+```
+
+
+### Plots
+```{r}
+pten_plot(indata)
+```
+
+## SU2C correlation matrix {.tabset}
+### Median of absolute values
+```{r}
+indata <- su2c_2015
+
+
+df_coef <- as.data.frame(unlist(pten_coef(indata)))
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+df <- as.data.frame(unlist(pval))
+
+names(df) <- "pval"
+
+names(df_coef) <- "coef"
+
+df <- cbind(df_coef, df)
+
+datatable(df, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+# tab_df(df,
+#        title="Table 2. Spearman Correlation Coefficients of PTEN vs Cancer Signature Genes.",
+#        alternate.rows = TRUE,
+#        digits = 3,
+#        file = "dkfz_coef_pval.doc")
+
+```
+
+
+### Plots {.tabset}
+```{r}
+pten_plot(indata)
+```
+
+## SU2C_young correlation matrix  {.tabset}
+### Median of absolute values
+```{r}
+indata <- su2c_young
+
+
+df_coef <- as.data.frame(unlist(pten_coef(indata)))
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+df <- as.data.frame(unlist(pval))
+
+names(df) <- "pval"
+
+names(df_coef) <- "coef"
+
+df <- cbind(df_coef, df)
+
+datatable(df, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+# tab_df(df,
+#        title="Table 2. Spearman Correlation Coefficients of PTEN vs Cancer Signature Genes.",
+#        alternate.rows = TRUE,
+#        digits = 3,
+#        file = "dkfz_coef_pval.doc")
+
+```
+
+
+### Plots
+```{r}
+pten_plot(indata)
+
+```
+
+## SU2C_old correlation matrix  {.tabset}
+### Median of absolute values
+```{r}
+indata <- su2c_old
+
+
+df_coef <- as.data.frame(unlist(pten_coef(indata)))
+
+mat <- assay(indata, "log_counts")
+
+
+
+pval <- vector("list", length(prCancer_sigs))
+for(i in seq_along(prCancer_sigs)){
+  pval[i] <- sig_coeflist(prlist = prCancer_sigs[[i]])
+}
+
+names(pval) <- names(prCancer_sigs)
+
+df <- as.data.frame(unlist(pval))
+
+names(df) <- "pval"
+
+names(df_coef) <- "coef"
+
+df <- cbind(df_coef, df)
+
+datatable(df, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+# tab_df(df,
+#        title="Table 2. Spearman Correlation Coefficients of PTEN vs Cancer Signature Genes.",
+#        alternate.rows = TRUE,
+#        digits = 3,
+#        file = "dkfz_coef_pval.doc")
+
+```
+
+
+### Plots {.tabset}
+```{r}
+pten_plot(indata)
+```
+
+
+# Grouping by quartiles for ssGSEA and correlations {.tabset}
+
+Databases were grouped by log_cpm into quartiles of PTEN expression, which were graphed using boxplots. The first quartile are those with lower PTEN expression, and the 4th quartile have the highest PTEN expression. Quartile numbers were added to colData of the datasets for ssGSEA scoring of cancer signatures between the 1st and 4th quartiles. 
+
+## TCGA quartile {.tabset}
+```{r}
+# temporary SE
+#prad_tcga <- readRDS("prad_tcga_SE.RDS")
+temp_tcga <- prad_tcga
+gmat <- as.data.frame(t(assay(prad_tcga, "log_cpm")))
+
+# group data by quartiles, top = 1, bottom = 4
+temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+top_temp <- temp[temp$quartile == 1,]
+mid_temp <- temp[temp$quartile == 3,]
+low_temp <- temp[temp$quartile == 4,]
+
+#make quartile variable for SE, no need for middle quartiles
+quartile <- rep(2,ncol(temp_tcga))
+quartile[colnames(temp_tcga) %in% rownames(top_temp)]= 1
+quartile[colnames(temp_tcga) %in% rownames(mid_temp)]= 3
+quartile[colnames(temp_tcga) %in% rownames(low_temp)]= 4
+
+#add quartile label for SE
+colData(temp_tcga)$quartile <- factor(quartile)
+rm(quartile)
+
+prad_tcga <- temp_tcga
+
+#filter out the middle quartiles for ssGSEA
+temp_tcga = temp_tcga[,colData(temp_tcga)$quartile != 2 & colData(temp_tcga)$quartile != 3 ]
+dim(temp_tcga)
+table(colData(temp_tcga)$quartile)
+
+
+
+```
+
+### Quartile distribution of pten
+```{r}
+# histogram of pten expression
+# matrix of log_cpm 
+
+gmat <- as.data.frame(t(assay(prad_tcga, "log_cpm")))
+
+#allmat <- rbind.fill(smat, dmat, gmat)
+
+#histogram of log_cpm
+hist(gmat$PTEN)
+
+#histogram of counts
+tcga_counts <- as.data.frame(t(assay(prad_tcga, "counts")))
+hist(tcga_counts$PTEN)
+
+#temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+temp_tcga_q <- tcga_counts %>%  mutate(quartile = ntile(PTEN, 4))
+
+#boxplot of counts quartiles
+boxplot(temp_tcga_q$PTEN~ temp$quartile)
+
+#mean of first and 4th quartile
+temp_tcga_q1 <- (temp_tcga_q[temp_tcga_q$quartile==1, ])
+mean(temp_tcga_q1$PTEN)
+temp_tcga_q4 <- (temp_tcga_q[temp_tcga_q$quartile==4, ])
+mean(temp_tcga_q4$PTEN)
+
+
+```
+
+
+
+
+
+
+
+
+## TCGA young quartile {.tabset}
+```{r}
+# temporary SE
+#prad_tcga <- readRDS("prad_tcga_SE.RDS")
+temp_tcga_young <- tcga_young
+gmat <- as.data.frame(t(assay(tcga_young, "log_cpm")))
+
+# group data by quartiles, top = 1, bottom = 4
+temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+top_temp <- temp[temp$quartile == 1,]
+mid_temp <- temp[temp$quartile == 3,]
+low_temp <- temp[temp$quartile == 4,]
+
+#make quartile variable for SE, no need for middle quartiles
+quartile <- rep(2,ncol(temp_tcga_young))
+quartile[colnames(temp_tcga_young) %in% rownames(top_temp)]= 1
+quartile[colnames(temp_tcga_young) %in% rownames(mid_temp)]= 3
+quartile[colnames(temp_tcga_young) %in% rownames(low_temp)]= 4
+
+#add quartile label for SE
+colData(temp_tcga_young)$quartile <- factor(quartile)
+rm(quartile)
+
+tcga_young <- temp_tcga_young
+
+#filter out the middle quartiles for ssGSEA
+temp_tcga_young = temp_tcga_young[,colData(temp_tcga_young)$quartile != 2 & colData(temp_tcga_young)$quartile != 3 ]
+dim(temp_tcga_young)
+table(colData(temp_tcga_young)$quartile)
+
+
+
+```
+
+### Quartile distribution of pten
+```{r}
+# histogram of pten expression
+# matrix of log_cpm 
+
+gmat <- as.data.frame(t(assay(tcga_young, "log_cpm")))
+
+#allmat <- rbind.fill(smat, dmat, gmat)
+
+#histogram of log_cpm
+hist(gmat$PTEN)
+
+#histogram of counts
+tcga_counts <- as.data.frame(t(assay(tcga_young, "counts")))
+hist(tcga_counts$PTEN)
+
+#temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+temp_tcga_q <- tcga_counts %>%  mutate(quartile = ntile(PTEN, 4))
+
+#boxplot of counts quartiles
+boxplot(temp_tcga_q$PTEN~ temp$quartile)
+
+#mean of first and 4th quartile
+temp_tcga_q1 <- (temp_tcga_q[temp_tcga_q$quartile==1, ])
+mean(temp_tcga_q1$PTEN)
+temp_tcga_q4 <- (temp_tcga_q[temp_tcga_q$quartile==4, ])
+mean(temp_tcga_q4$PTEN)
+
+
+```
+
+
+
+
+
+
+
+
+## TCGA old quartile {.tabset}
+```{r}
+# temporary SE
+#prad_tcga <- readRDS("prad_tcga_SE.RDS")
+temp_tcga_old <- tcga_old
+gmat <- as.data.frame(t(assay(tcga_old, "log_cpm")))
+
+# group data by quartiles, top = 1, bottom = 4
+temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+top_temp <- temp[temp$quartile == 1,]
+mid_temp <- temp[temp$quartile == 3,]
+low_temp <- temp[temp$quartile == 4,]
+
+#make quartile variable for SE, no need for middle quartiles
+quartile <- rep(2,ncol(temp_tcga_old))
+quartile[colnames(temp_tcga_old) %in% rownames(top_temp)]= 1
+quartile[colnames(temp_tcga_old) %in% rownames(mid_temp)]= 3
+quartile[colnames(temp_tcga_old) %in% rownames(low_temp)]= 4
+
+#add quartile label for SE
+colData(temp_tcga_old)$quartile <- factor(quartile)
+rm(quartile)
+
+tcga_old <- temp_tcga_old
+
+#filter out the middle quartiles for ssGSEA
+temp_tcga_old = temp_tcga_old[,colData(temp_tcga_old)$quartile != 2 & colData(temp_tcga_old)$quartile != 3 ]
+dim(temp_tcga_old)
+table(colData(temp_tcga_old)$quartile)
+
+
+
+```
+
+### Quartile distribution of pten
+```{r}
+# histogram of pten expression
+# matrix of log_cpm 
+
+gmat <- as.data.frame(t(assay(tcga_old, "log_cpm")))
+
+#allmat <- rbind.fill(smat, dmat, gmat)
+
+#histogram of log_cpm
+hist(gmat$PTEN)
+
+#histogram of counts
+tcga_counts <- as.data.frame(t(assay(tcga_old, "counts")))
+hist(tcga_counts$PTEN)
+
+#temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+temp_tcga_q <- tcga_counts %>%  mutate(quartile = ntile(PTEN, 4))
+
+#boxplot of counts quartiles
+boxplot(temp_tcga_q$PTEN~ temp$quartile)
+
+#mean of first and 4th quartile
+temp_tcga_q1 <- (temp_tcga_q[temp_tcga_q$quartile==1, ])
+mean(temp_tcga_q1$PTEN)
+temp_tcga_q4 <- (temp_tcga_q[temp_tcga_q$quartile==4, ])
+mean(temp_tcga_q4$PTEN)
+
+
+```
+
+
+
+
+
+
+
+
+## DKFZ Grouping by quartile {.tabset}
+```{r}
+
+indata <- dkfz_se
+
+dmat <- as.data.frame(t(assay(indata, "log_cpm")))
+
+
+# group data by quartiles, top = 1, bottom = 4
+temp <- dmat  %>%  mutate(quartile = ntile(PTEN, 4))
+top_temp <- temp[temp$quartile == 1,]
+mid_temp <- temp[temp$quartile == 3,]
+low_temp <- temp[temp$quartile == 4,]
+
+#make quartile variable for SE, no need for middle quartiles
+quartile <- rep(2,ncol(indata))
+quartile[colnames(indata) %in% rownames(top_temp)]= 1
+quartile[colnames(indata) %in% rownames(mid_temp)]= 3
+quartile[colnames(indata) %in% rownames(low_temp)]= 4
+
+#add quartile label for SE
+colData(indata)$quartile <- factor(quartile)
+rm(quartile)
+
+#filter out the middle quartiles for ssGSEA
+temp_dkfz = indata[,colData(indata)$quartile != 2 & colData(indata)$quartile != 3 ]
+dim(temp_dkfz)
+table(colData(temp_dkfz)$quartile)
+
+dkfz_se <- indata
+```
+
+### Quartile distribution of DKFZ
+```{r}
+hist(dmat$PTEN)
+indata <- dkfz_se
+
+counts <- as.data.frame(t(assay(indata, "counts")))
+hist(counts$PTEN)
+
+#temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+indata_q <- counts %>%  mutate(quartile = ntile(PTEN, 4))
+
+boxplot(indata_q$PTEN~ indata_q$quartile)
+
+indata_q1 <- (indata_q[indata_q$quartile==1, ])
+mean(indata_q1$PTEN)
+indata_q4 <- (indata_q[indata_q$quartile==4, ])
+mean(indata_q4$PTEN) 
+
+
+```
+
+## SU2C Grouping by quartile {.tabset}
+```{r}
+indata <- su2c_2015
+
+dmat <- as.data.frame(t(assay(indata, "log_cpm")))
+
+
+# group data by quartiles, top = 1, bottom = 4
+temp <- dmat  %>%  mutate(quartile = ntile(PTEN, 4))
+top_temp <- temp[temp$quartile == 1,]
+mid_temp <- temp[temp$quartile == 3,]
+low_temp <- temp[temp$quartile == 4,]
+
+#make quartile variable for SE, no need for middle quartiles
+quartile <- rep(2,ncol(indata))
+quartile[colnames(indata) %in% rownames(top_temp)]= 1
+quartile[colnames(indata) %in% rownames(mid_temp)]= 3
+quartile[colnames(indata) %in% rownames(low_temp)]= 4
+
+#add quartile label for SE
+colData(indata)$quartile <- factor(quartile)
+rm(quartile)
+
+#filter out the middle quartiles for ssGSEA
+su2c_temp = indata[,colData(indata)$quartile != 2 & colData(indata)$quartile != 3 ]
+dim(indata)
+dim(su2c_temp)
+table(colData(su2c_temp)$quartile)
+
+su2c_2015 <- indata
+```
+
+### Quartile distribution of SU2C
+```{r}
+hist(dmat$PTEN)
+
+
+counts <- as.data.frame(t(assay(indata, "counts")))
+hist(counts$PTEN)
+
+#temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+indata_q <- counts %>%  mutate(quartile = ntile(PTEN, 4))
+
+boxplot(indata_q$PTEN~ indata_q$quartile)
+
+indata_q1 <- (indata_q[indata_q$quartile==1, ])
+mean(indata_q1$PTEN)
+indata_q4 <- (indata_q[indata_q$quartile==4, ])
+mean(indata_q4$PTEN) 
+
+
+```
+
+## SU2C_young Grouping by quartile {.tabset}
+```{r}
+indata <- su2c_young
+
+dmat <- as.data.frame(t(assay(indata, "log_cpm")))
+
+
+# group data by quartiles, top = 1, bottom = 4
+temp <- dmat  %>%  mutate(quartile = ntile(PTEN, 4))
+top_temp <- temp[temp$quartile == 1,]
+mid_temp <- temp[temp$quartile == 3,]
+low_temp <- temp[temp$quartile == 4,]
+
+#make quartile variable for SE, no need for middle quartiles
+quartile <- rep(2,ncol(indata))
+quartile[colnames(indata) %in% rownames(top_temp)]= 1
+quartile[colnames(indata) %in% rownames(mid_temp)]= 3
+quartile[colnames(indata) %in% rownames(low_temp)]= 4
+
+#add quartile label for SE
+colData(indata)$quartile <- factor(quartile)
+rm(quartile)
+
+su2c_young <- indata
+#filter out the middle quartiles for ssGSEA
+temp_su2c_young = indata[,colData(indata)$quartile != 2 & colData(indata)$quartile != 3 ]
+dim(temp_su2c_young)
+table(colData(temp_su2c_young)$quartile)
+
+
+```
+
+### Quartile distribution of SU2C_young
+```{r}
+hist(dmat$PTEN)
+
+counts <- as.data.frame(t(assay(indata, "counts")))
+hist(counts$PTEN)
+
+#temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+indata_q <- counts %>%  mutate(quartile = ntile(PTEN, 4))
+
+boxplot(indata_q$PTEN~ indata_q$quartile)
+
+indata_q1 <- (indata_q[indata_q$quartile==1, ])
+mean(indata_q1$PTEN)
+indata_q4 <- (indata_q[indata_q$quartile==4, ])
+mean(indata_q4$PTEN) 
+
+
+```
+
+## SU2C_old Grouping by quartile {.tabset}
+```{r}
+indata <- su2c_old
+
+dmat <- as.data.frame(t(assay(indata, "log_cpm")))
+
+
+# group data by quartiles, top = 1, bottom = 4
+temp <- dmat  %>%  mutate(quartile = ntile(PTEN, 4))
+top_temp <- temp[temp$quartile == 1,]
+mid_temp <- temp[temp$quartile == 3,]
+low_temp <- temp[temp$quartile == 4,]
+
+#make quartile variable for SE, no need for middle quartiles
+quartile <- rep(2,ncol(indata))
+quartile[colnames(indata) %in% rownames(top_temp)]= 1
+quartile[colnames(indata) %in% rownames(mid_temp)]= 3
+quartile[colnames(indata) %in% rownames(low_temp)]= 4
+
+#add quartile label for SE
+colData(indata)$quartile <- factor(quartile)
+rm(quartile)
+
+su2c_old <- indata
+#filter out the middle quartiles for ssGSEA
+temp_su2c_old = indata[,colData(indata)$quartile != 2 & colData(indata)$quartile != 3 ]
+dim(temp_su2c_old)
+table(colData(temp_su2c_old)$quartile)
+
+```
+
+### Quartile distribution of SU2C_old
+```{r}
+hist(dmat$PTEN)
+
+counts <- as.data.frame(t(assay(indata, "counts")))
+hist(counts$PTEN)
+
+#temp <- gmat %>% mutate(quartile = ntile(PTEN, 4))
+indata_q <- counts %>%  mutate(quartile = ntile(PTEN, 4))
+
+boxplot(indata_q$PTEN~ indata_q$quartile)
+
+indata_q1 <- (indata_q[indata_q$quartile==1, ])
+mean(indata_q1$PTEN)
+indata_q4 <- (indata_q[indata_q$quartile==4, ])
+mean(indata_q4$PTEN) 
+
+
+```
+
+# Signature Profiler TCGA {.tabset}
+```{r, message=FALSE, results='hide'}
+
+prCancer_sigs <- readRDS("prCancer_sigs.RDS")
+## put prCancer_sigs into a form TBSignatureProfiler can use
+#prCancer_sigs <- lapply(prCancer_sigs, unlist)
+#prCancer_sigs <- lapply(prCancer_sigs, noquote)
+#saveRDS(prCancer_sigs,"prCancer_sigs.RDS")
+
+indata <- temp_tcga
+
+gsva_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "GSVA", signatures = prCancer_sigs, parallel.sz = 4)
+ssgsea_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "ssGSEA",
+                               signatures = prCancer_sigs, parallel.sz = 4)
+
+plage_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "PLAGE", signatures = prCancer_sigs, parallel.sz = 4)
+
+```
+
+
+## GSVA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE,
+                 split_heatmap='none')
+```
+
+
+### Boxplot
+
+```{r }
+signatureBoxplot(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"))# , rotateLabels = TRUE)
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(gsva_res,
+                         name=i, 
+                         signatureColNames = i,
+                         annotationColName = c("quartile"),   
+                         rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis", message=FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(gsva_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order = NULL)
+
+  cat("\n\n")
+}
+
+```
+
+### AUC Table {.tabset}
+```{r, message = FALSE}
+set.seed(0)
+tableAUC(gsva_res,
+         annotationColName = "quartile",
+         signatureColNames = names(prCancer_sigs),
+         num.boot = 100,
+         pb.show = FALSE)
+```
+
+### AUC Boxplots
+```{r, message = FALSE}
+set.seed(0)
+compareBoxplots(gsva_res, annotationColName = "quartile",
+                signatureColNames = names(prCancer_sigs),
+                pb.show = FALSE, fill.col = "blue",
+                rotateLabels = TRUE)
+```
+
+### ROC plots
+```{r, message = FALSE, fig.height = 9, fig.width = 12}
+signatureROCplot_CI(inputData = gsva_res,
+                   signatureColNames = names(prCancer_sigs),
+                   annotationColName = "quartile")
+
+```
+
+### Separate ROC plots  {.tabset}
+
+```{r, results = 'asis', message = FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureROCplot_CI(inputData = gsva_res,
+                   signatureColNames = i,
+                   annotationColName = "quartile",
+                   name = paste("ROC plot,", i, sep = " ")))
+
+  cat("\n\n")
+}
+```
+
+
+
+## ssGSEA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(ssgsea_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(ssgsea_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+### AUC Table
+```{r, message = FALSE}
+set.seed(0)
+tableAUC(ssgsea_res,
+         annotationColName = "quartile",
+         signatureColNames = names(prCancer_sigs),
+         num.boot = 100,
+         pb.show = FALSE)
+```
+
+### AUC Boxplots {.tabset}
+```{r, message = FALSE}
+set.seed(0)
+compareBoxplots(ssgsea_res, annotationColName = "quartile",
+                signatureColNames = names(prCancer_sigs),
+                pb.show = FALSE, fill.col = "blue",
+                rotateLabels = TRUE)
+```
+
+### ROC plots
+```{r, message = FALSE, fig.height = 9, fig.width = 12}
+signatureROCplot_CI(inputData = ssgsea_res,
+                   signatureColNames = names(prCancer_sigs),
+                   annotationColName = "quartile")
+
+```
+
+### Separate ROC plots  {.tabset}
+
+```{r, results = 'asis', message = FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureROCplot_CI(inputData = ssgsea_res,
+                   signatureColNames = i,
+                   annotationColName = "quartile",
+                   name = paste("ROC plot,", i, sep = " ")))
+
+  cat("\n\n")
+}
+```
+
+
+## PLAGE {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(plage_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(plage_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+### AUC Table
+```{r, message = FALSE}
+set.seed(0)
+tableAUC(plage_res,
+         annotationColName = "quartile",
+         signatureColNames = names(prCancer_sigs),
+         num.boot = 100,
+         pb.show = FALSE)
+```
+
+### AUC Boxplots {.tabset}
+```{r, message = FALSE}
+set.seed(0)
+compareBoxplots(plage_res, annotationColName = "quartile",
+                signatureColNames = names(prCancer_sigs),
+                pb.show = FALSE, fill.col = "blue",
+                rotateLabels = TRUE)
+```
+
+### ROC plots
+```{r, message = FALSE, fig.height = 9, fig.width = 12}
+signatureROCplot_CI(inputData = plage_res,
+                   signatureColNames = names(prCancer_sigs),
+                   annotationColName = "quartile")
+
+```
+
+### Separate ROC plots  {.tabset}
+
+```{r, results = 'asis', message = FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureROCplot_CI(inputData = plage_res,
+                   signatureColNames = i,
+                   annotationColName = "quartile",
+                   name = paste("ROC plot,", i, sep = " ")))
+
+  cat("\n\n")
+}
+```
+
+
+
+
+
+
+# Signature Profiler DKFZ {.tabset}
+```{r, message=FALSE, results='hide'}
+
+prCancer_sigs <- readRDS("prCancer_sigs.RDS")
+
+indata <- temp_dkfz
+
+gsva_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "GSVA", signatures = prCancer_sigs, parallel.sz = 4)
+ssgsea_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "ssGSEA",
+                               signatures = prCancer_sigs, parallel.sz = 4)
+
+plage_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "PLAGE", signatures = prCancer_sigs, parallel.sz = 4)
+
+```
+
+
+## GSVA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE,
+                 split_heatmap='none')
+```
+
+
+### Boxplot
+
+```{r }
+signatureBoxplot(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"))# , rotateLabels = TRUE)
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(gsva_res,
+                         name=i, 
+                         signatureColNames = i,
+                         annotationColName = c("quartile"),   
+                         rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis", message=FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(gsva_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order = NULL)
+
+  cat("\n\n")
+}
+
+```
+
+### AUC Table {.tabset}
+```{r, message = FALSE}
+set.seed(0)
+tableAUC(gsva_res,
+         annotationColName = "quartile",
+         signatureColNames = names(prCancer_sigs),
+         num.boot = 100,
+         pb.show = FALSE)
+```
+
+### AUC Boxplots
+```{r, message = FALSE}
+set.seed(0)
+compareBoxplots(gsva_res, annotationColName = "quartile",
+                signatureColNames = names(prCancer_sigs),
+                pb.show = FALSE, fill.col = "blue",
+                rotateLabels = TRUE)
+```
+
+### ROC plots
+```{r, message = FALSE, fig.height = 9, fig.width = 12}
+signatureROCplot_CI(inputData = gsva_res,
+                   signatureColNames = names(prCancer_sigs),
+                   annotationColName = "quartile")
+
+```
+
+### Separate ROC plots  {.tabset}
+
+```{r, results = 'asis', message = FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureROCplot_CI(inputData = gsva_res,
+                   signatureColNames = i,
+                   annotationColName = "quartile",
+                   name = paste("ROC plot,", i, sep = " ")))
+
+  cat("\n\n")
+}
+```
+
+
+
+## ssGSEA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(ssgsea_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(ssgsea_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+### AUC Table
+```{r, message = FALSE}
+set.seed(0)
+tableAUC(ssgsea_res,
+         annotationColName = "quartile",
+         signatureColNames = names(prCancer_sigs),
+         num.boot = 100,
+         pb.show = FALSE)
+```
+
+### AUC Boxplots {.tabset}
+```{r, message = FALSE}
+set.seed(0)
+compareBoxplots(ssgsea_res, annotationColName = "quartile",
+                signatureColNames = names(prCancer_sigs),
+                pb.show = FALSE, fill.col = "blue",
+                rotateLabels = TRUE)
+```
+
+### ROC plots
+```{r, message = FALSE, fig.height = 9, fig.width = 12}
+signatureROCplot_CI(inputData = ssgsea_res,
+                   signatureColNames = names(prCancer_sigs),
+                   annotationColName = "quartile")
+
+```
+
+### Separate ROC plots  {.tabset}
+
+```{r, results = 'asis', message = FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureROCplot_CI(inputData = ssgsea_res,
+                   signatureColNames = i,
+                   annotationColName = "quartile",
+                   name = paste("ROC plot,", i, sep = " ")))
+
+  cat("\n\n")
+}
+```
+
+
+## PLAGE {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(plage_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(plage_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+### AUC Table
+```{r, message = FALSE}
+set.seed(0)
+tableAUC(plage_res,
+         annotationColName = "quartile",
+         signatureColNames = names(prCancer_sigs),
+         num.boot = 100,
+         pb.show = FALSE)
+```
+
+### AUC Boxplots {.tabset}
+```{r, message = FALSE}
+set.seed(0)
+compareBoxplots(plage_res, annotationColName = "quartile",
+                signatureColNames = names(prCancer_sigs),
+                pb.show = FALSE, fill.col = "blue",
+                rotateLabels = TRUE)
+```
+
+### ROC plots
+```{r, message = FALSE, fig.height = 9, fig.width = 12}
+signatureROCplot_CI(inputData = plage_res,
+                   signatureColNames = names(prCancer_sigs),
+                   annotationColName = "quartile")
+
+```
+
+### Separate ROC plots  {.tabset}
+
+```{r, results = 'asis', message = FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureROCplot_CI(inputData = plage_res,
+                   signatureColNames = i,
+                   annotationColName = "quartile",
+                   name = paste("ROC plot,", i, sep = " ")))
+
+  cat("\n\n")
+}
+```
+
+
+
+
+
+
+
+# Signature Profiler su2c {.tabset}
+```{r, message=FALSE, results='hide'}
+
+
+
+indata <- su2c_temp
+
+gsva_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "GSVA", signatures = prCancer_sigs, parallel.sz = 4)
+ssgsea_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "ssGSEA",
+                               signatures = prCancer_sigs, parallel.sz = 4)
+
+plage_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "PLAGE", signatures = prCancer_sigs, parallel.sz = 4)
+
+```
+
+
+## GSVA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE,
+                 split_heatmap='none')
+```
+
+
+### Boxplot
+
+```{r }
+signatureBoxplot(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"))# , rotateLabels = TRUE)
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(gsva_res,
+                         name=i, 
+                         signatureColNames = i,
+                         annotationColName = c("quartile"),   
+                         rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis", message=FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(gsva_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order = NULL)
+
+  cat("\n\n")
+}
+
+```
+
+### AUC Table {.tabset}
+```{r, message = FALSE, eval = FALSE}
+set.seed(0)
+tableAUC(gsva_res,
+         annotationColName = "quartile",
+         signatureColNames = names(prCancer_sigs),
+         num.boot = 100,
+         pb.show = FALSE)
+```
+
+### AUC Boxplots
+```{r, message = FALSE}
+set.seed(0)
+compareBoxplots(gsva_res, annotationColName = "quartile",
+                signatureColNames = names(prCancer_sigs),
+                pb.show = FALSE, fill.col = "blue",
+                rotateLabels = TRUE)
+```
+
+### ROC plots
+```{r, message = FALSE, fig.height = 9, fig.width = 12}
+signatureROCplot_CI(inputData = gsva_res,
+                   signatureColNames = names(prCancer_sigs),
+                   annotationColName = "quartile")
+
+```
+
+### Separate ROC plots  {.tabset}
+
+```{r, results = 'asis', message = FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureROCplot_CI(inputData = gsva_res,
+                   signatureColNames = i,
+                   annotationColName = "quartile",
+                   name = paste("ROC plot,", i, sep = " ")))
+
+  cat("\n\n")
+}
+```
+
+
+
+## ssGSEA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(ssgsea_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(ssgsea_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+### AUC Table
+```{r, message = FALSE}
+set.seed(0)
+tableAUC(ssgsea_res,
+         annotationColName = "quartile",
+         signatureColNames = names(prCancer_sigs),
+         num.boot = 100,
+         pb.show = FALSE)
+```
+
+### AUC Boxplots {.tabset}
+```{r, message = FALSE}
+set.seed(0)
+compareBoxplots(ssgsea_res, annotationColName = "quartile",
+                signatureColNames = names(prCancer_sigs),
+                pb.show = FALSE, fill.col = "blue",
+                rotateLabels = TRUE)
+```
+
+### ROC plots
+```{r, message = FALSE, fig.height = 9, fig.width = 12}
+signatureROCplot_CI(inputData = ssgsea_res,
+                   signatureColNames = names(prCancer_sigs),
+                   annotationColName = "quartile")
+
+```
+
+### Separate ROC plots  {.tabset}
+
+```{r, results = 'asis', message = FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureROCplot_CI(inputData = ssgsea_res,
+                   signatureColNames = i,
+                   annotationColName = "quartile",
+                   name = paste("ROC plot,", i, sep = " ")))
+
+  cat("\n\n")
+}
+```
+
+
+## PLAGE {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(plage_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(plage_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+### AUC Table
+```{r, message = FALSE}
+set.seed(0)
+tableAUC(plage_res,
+         annotationColName = "quartile",
+         signatureColNames = names(prCancer_sigs),
+         num.boot = 100,
+         pb.show = FALSE)
+```
+
+### AUC Boxplots {.tabset}
+```{r, message = FALSE}
+set.seed(0)
+compareBoxplots(plage_res, annotationColName = "quartile",
+                signatureColNames = names(prCancer_sigs),
+                pb.show = FALSE, fill.col = "blue",
+                rotateLabels = TRUE)
+```
+
+### ROC plots
+```{r, message = FALSE, fig.height = 9, fig.width = 12}
+signatureROCplot_CI(inputData = plage_res,
+                   signatureColNames = names(prCancer_sigs),
+                   annotationColName = "quartile")
+
+```
+
+### Separate ROC plots  {.tabset}
+
+```{r, results = 'asis', message = FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureROCplot_CI(inputData = plage_res,
+                   signatureColNames = i,
+                   annotationColName = "quartile",
+                   name = paste("ROC plot,", i, sep = " ")))
+
+  cat("\n\n")
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+# Signature Profiler TCGA all quartiles {.tabset}
+```{r, message=FALSE, results='hide'}
+indata <- prad_tcga
+#prCancer_sigs <- readRDS("prCancer_sigs.RDS")
+## put prCancer_sigs into a form TBSignatureProfiler can use
+#prCancer_sigs <- lapply(prCancer_sigs, unlist)
+#prCancer_sigs <- lapply(prCancer_sigs, noquote)
+#saveRDS(prCancer_sigs,"prCancer_sigs.RDS")
+
+
+gsva_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "GSVA", signatures = prCancer_sigs, parallel.sz = 4)
+ssgsea_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "ssGSEA",
+                               signatures = prCancer_sigs, parallel.sz = 4)
+
+plage_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "PLAGE", signatures = prCancer_sigs, parallel.sz = 4)
+
+```
+
+
+## GSVA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE,
+                 split_heatmap='none')
+```
+
+
+### Boxplot
+
+```{r }
+signatureBoxplot(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"))# , rotateLabels = TRUE)
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(gsva_res,
+                         name=i, 
+                         signatureColNames = i,
+                         annotationColName = c("quartile"),   
+                         rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis", message=FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(gsva_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order = NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+## ssGSEA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(ssgsea_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(ssgsea_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+
+## PLAGE {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(plage_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(plage_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+
+# Signature Profiler DKFZ all quartiles {.tabset}
+```{r, message=FALSE, results='hide'}
+
+
+indata <- dkfz_se
+
+gsva_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "GSVA", signatures = prCancer_sigs, parallel.sz = 4)
+ssgsea_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "ssGSEA",
+                               signatures = prCancer_sigs, parallel.sz = 4)
+
+plage_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "PLAGE", signatures = prCancer_sigs, parallel.sz = 4)
+
+```
+
+
+## GSVA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE,
+                 split_heatmap='none')
+```
+
+
+### Boxplot
+
+```{r }
+signatureBoxplot(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"))# , rotateLabels = TRUE)
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(gsva_res,
+                         name=i, 
+                         signatureColNames = i,
+                         annotationColName = c("quartile"),   
+                         rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis", message=FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(gsva_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order = NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+## ssGSEA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(ssgsea_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(ssgsea_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+
+## PLAGE {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(plage_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(plage_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+
+# Signature Profiler su2c all quartiles {.tabset}
+```{r, message=FALSE, results='hide'}
+
+indata <- su2c_2015
+
+gsva_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "GSVA", signatures = prCancer_sigs, parallel.sz = 4)
+ssgsea_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "ssGSEA",
+                               signatures = prCancer_sigs, parallel.sz = 4)
+
+plage_res <- TBSignatureProfiler::runTBsigProfiler(indata, useAssay = "log_cpm", algorithm = "PLAGE", signatures = prCancer_sigs, parallel.sz = 4)
+
+```
+
+
+## GSVA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE,
+                 split_heatmap='none')
+```
+
+
+### Boxplot
+
+```{r }
+signatureBoxplot(gsva_res, name="GSVA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"))# , rotateLabels = TRUE)
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(gsva_res,
+                         name=i, 
+                         signatureColNames = i,
+                         annotationColName = c("quartile"),   
+                         rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis", message=FALSE}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(gsva_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order = NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+## ssGSEA {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(ssgsea_res, name="ssGSEA", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(ssgsea_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(ssgsea_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+
+
+## PLAGE {.tabset}
+
+### Heatmap
+
+```{r }
+signatureHeatmap(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColNames = c("quartile"),
+                 showColumnNames = FALSE, scale = TRUE,
+                 split_heatmap='none')
+```
+
+### Boxplot
+
+```{r }
+signatureBoxplot(plage_res, name="PLAGE", signatureColNames = names(prCancer_sigs),
+                 annotationColName = c("quartile"), scale = TRUE) #rotateLabels = TRUE,
+```
+
+### Boxplots Single {.tabset}
+
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  print(signatureBoxplot(plage_res, name=i, signatureColNames = i,
+                 annotationColName = c("quartile"), rotateLabels = T))
+
+  cat("\n\n")
+}
+
+```
+
+### Signature plots {.tabset}
+```{r , results="asis"}
+for (i in names(prCancer_sigs)){
+
+  cat("####", i, "\n")
+
+  signatureGeneHeatmap(plage_res, useAssay="log_cpm",
+                     prCancer_sigs[[i]],
+                     name = i, signatureColNames = NULL,
+                     annotationColNames = c("quartile",i),
+                     showColumnNames = FALSE, 
+                     column_order =  NULL)
+
+  cat("\n\n")
+}
+
+```
+
+# MSigDB DKFZ
+```{r}
+
+sce <- as(dkfz_se, "SingleCellExperiment")
+pca_data <- prcomp(t(assays(sce)$"log_counts"), rank=50)
+
+
+library(Rtsne)
+set.seed(5252)
+tsne_data <- Rtsne(pca_data$x[,1:50], pca = FALSE)
+
+reducedDims(sce) <- list(PCA=pca_data$x, TSNE=tsne_data$Y)
+
+
+sce
+```
+
+# Differential Expression between low and high PTEN quartiles
+```{r diffex}
+#designMat <- model.matrix(~factor(Tb_status) + factor(bmi_cat2) + factor(Tb_status):factor(bmi_cat2), data=colData(indata))
+
+#designMat <- model.matrix(~factor(Tb_status) + factor(bmi_cat2), data=colData(indata))
+indata <- temp_dkfz
+
+designMat <- model.matrix(~factor(quartile), data=colData(indata))
+
+colnames(designMat)
+colnames(designMat) <- c("PTEN_lo", "PTEN_hi")
+
+head(designMat)
+
+fit <- lmFit(assay(indata, "log_cpm"), designMat)
+
+# Difference in expression between PTEN_lo individuals and PTEN_hi 
+
+contrast.matrixNut<- makeContrasts(PTEN_hi, levels = designMat)
+fitNut <- contrasts.fit(fit,contrast.matrixNut)
+fitNut <- eBayes(fitNut)
+limmaResNut <- topTable(fitNut, adjust.method = "BH", n = Inf, sort.by = "P")
+
+
+dim(limmaResNut[limmaResNut$adj.P.Val <0.05,])
+table(colData(indata)$bmi_cat2)
+
+new_hist_padjval_100breaks <- hist(limmaResNut$adj.P.Val, breaks=100)
+new_hist_pval_100breaks <- hist(limmaResNut$P.Value, breaks=100)
+##shows spike near 0
+
+sig_limmaResNut <- limmaResNut[limmaResNut$adj.P.Val <0.05,]
+sig_limmaResNut <- sig_limmaResNut[order(sig_limmaResNut$adj.P.Val),]
+
+#write.csv(sig_limmaResNut, "sig_TBgenes_padj.csv")
+
+top_500_genes <- sig_limmaResNut[1:500,]
+top_1k_genes <- sig_limmaResNut[1:1000,]
+
+```
+
+## All genes datatable and heatmap {.tabset}
+```{r diffex-datatable-heatmap}
+datatable(top_500_genes, 
+          options=list(scrollX=T,pageLength=20),
+          rownames = T)
+
+## Make a Heatmap of all genes
+mat = as.matrix(assay(indata[row.names(top_500_genes),],"log_cpm"))
+mat = t(scale(t(mat)))
+#mat = mat[,order(colData(indata)$"BMI")]
+
+df=data.frame(PTEN_status=colData(indata)$"quartile") 
+
+
+ha = HeatmapAnnotation(df = df, col = list(PTEN_status=c("4"="Red","1"="Blue")))
+
+Heatmap(mat,show_row_names=F,show_column_names = F, top_annotation = ha, cluster_columns = T )
+```
+
+## HypeR pathway correlations
+```{r}
+library(hypeR)
+
+# test for genes recognized in reactome
+genecheck <- function(genelist, database, output="recognized") {
+  ## Ensure databases are characters
+  database=as.character(database)
+  ## base_url of database gene libraries, make url of selected database
+  baseurl <- "https://amp.pharm.mssm.edu/Enrichr/geneSetLibrary?mode=text&libraryName="
+  
+  ## initialize list (to save time?)
+  database_loc <- list()
+  database_txt <- list()
+  no_col <- list()
+  df <- list()
+  
+  for(db in 1:length(database)) {
+    database_loc[db] <- paste0(baseurl,database[db])
+  
+    ## To properly read the txt, read.table requires number of columns or variables (genes, pathways here are observations or rows)
+    no_col[[db]] <- max(count.fields(database_loc[[db]], sep = "\t"), na.rm = TRUE)
+    database_txt[[db]] <- read.table(database_loc[[db]],sep="\t",fill=TRUE,header = F,col.names=paste0("V",seq_len(no_col[[db]])),quote="")
+  
+    
+    ## make a usable dataframe and list **might be a more efficient way**
+    df[[db]] <- as.data.frame(database_txt[[db]][,-2])
+    df[[db]] <- column_to_rownames(df[[db]], var = "V1")
+    df[[db]] <- unite(df[[db]], col="Genes", sep=";")
+  
+    
+    ## genelist
+    df[[db]] <- sapply(df[[db]], strsplit, ";")
+  
+    ## get rid of gene duplicates
+    df[[db]] <- unique(unlist(df[[db]]))
+    
+  }
+  
+  ## Character vector of all unique genes in databases
+  path_lib <- unique(unlist(df))
+  
+  ## check if genes are in database list
+  
+  rec_genes <- genelist[genelist %in% path_lib]
+  unrec_genes <- genelist[!genelist %in% path_lib]
+  
+  ##return either recognized genes or unrecognized genes
+  if(output=="recognized"){
+    return(rec_genes)
+  }
+  else if(output=="unrecognized") {
+    return(unrec_genes)
+  }
+  else {
+    print("Please define output as 'recognized' or 'unrecognized'. ")
+  }
+}
+
+# return only recognized genes
+top_500_reactome <- rownames(top_500_genes)
+top_500_reactome <- genecheck(top_500_genes, "Reactome_2016")
+
+
+```
+
+## Pathways
+```{r}
+## make hyper object
+BIOCARTA <- msigdb_gsets(species="Homo sapiens", category="C2", subcategory="CP:BIOCARTA")
+KEGG     <- msigdb_gsets(species="Homo sapiens", category="C2", subcategory="CP:KEGG")
+REACTOME <- msigdb_gsets(species="Homo sapiens", category="C2", subcategory="CP:REACTOME")
+
+c4_cgn <- msigdb_gsets(species="Homo sapiens", category="C4", subcategory = "CGN" )
+c4_cm <- msigdb_gsets(species="Homo sapiens", category="C4", subcategory = "CM" )
+
+
+```
+
+## Hypergeomtric test with REACTOME
+```{r}
+hyp_reactome <- hypeR(rownames(top_1k_genes) , REACTOME, test="hypergeometric", background=16695)
+
+hyp_dots(hyp_reactome, merge=TRUE, fdr=0.05, title="Co-expression Modules")
+
+
+```
+
+```{r}
+
+hyp_show(hyp_reactome)
+
+```
+
+## Hypergeomtric test with KEGG
+```{r}
+hyp_KEGG <- hypeR(rownames(top_1k_genes) , KEGG, test="hypergeometric", background=16695)
+
+hyp_dots(hyp_KEGG, merge=TRUE, fdr=0.05, title="Co-expression Modules")
+
+
+```
+
+## Hypergeomtric test with BIOCARTA
+```{r}
+hyp_BIOCARTA <- hypeR(rownames(top_1k_genes) , BIOCARTA, test="hypergeometric", background=16695)
+
+hyp_dots(hyp_BIOCARTA, merge=TRUE, fdr=0.05, title="Co-expression Modules")
+
+
+```
+
+## Hypergeomtric test with CGN
+```{r}
+hyp_cgn <- hypeR(rownames(top_1k_genes) , c4_cgn  , test="hypergeometric", background=16695)
+
+hyp_dots(hyp_cgn, merge=TRUE, fdr=0.05, title="Co-expression Modules")
+
+
+```
+
+```{r}
+
+hyp_show(hyp_cgn)
+
+```
+
+## Hypergeomtric test with CM
+```{r}
+hyp_cm <- hypeR(rownames(top_1k_genes) , c4_cm, test="hypergeometric", background=16695)
+
+hyp_dots(hyp_cm, merge=TRUE, fdr=0.05, title="Co-expression Modules")
+
+
+```
+
+```{r}
+
+hyp_show(hyp_cm)
+
+```
+
+#Dimension Reduction DKFZ {.tabset}
+## PCA
+```{r}
+indata_tmp <- dkfz_se
+
+plotPCA( DESeqTransform(indata_tmp), intgroup = "quartile")
+```
+
+## tSNE
+```{r}
+assay_type = "log_cpm"
+indata <- dkfz_se
+
+set.seed(1)
+tsne_out <- Rtsne(t(assay(indata,assay_type)), check_duplicates = FALSE, pca = TRUE, perplexity=10, theta=0.5, dims=2)
+
+embedding <- as.data.frame(tsne_out$Y)
+embedding$Class <- (indata$quartile )
+
+
+g <- ggplot(embedding, 
+            aes(x=V1, y=V2, color=Class), label = colnames(assay(indata,assay_type))) + geom_point(size=1.5) + xlab("T-SNE 1") + ylab("T-SNE 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("TSNE Plot") 
+
+plot(g)
+
+```
+
+## UMAP
+```{r, echo=FALSE}
+assay_type = "log_cpm"
+
+set.seed(1)
+umap_out <- umap(t(assay(indata,assay_type)))
+
+embedding <- as.data.frame(umap_out$layout)
+embedding$Class <- as.factor(indata$quartile)
+
+g <- ggplot(embedding, aes(x=V1, y=V2, color=Class, label = colnames(assay(indata,assay_type)))) + geom_point(size=1.5) + xlab("UMAP 1") + ylab("UMAP 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("UMAP Plot")
+
+plot(g)
+```
+
+#Dimension Reduction TCGA {.tabset}
+## PCA
+```{r}
+indata <- prad_tcga
+
+plotPCA( DESeqTransform(indata), intgroup = "quartile")
+```
+
+## tSNE
+```{r}
+assay_type = "log_cpm"
+#indata <- dkfz_se
+
+set.seed(1)
+tsne_out <- Rtsne(t(assay(indata,assay_type)), check_duplicates = FALSE, pca = TRUE, perplexity=10, theta=0.5, dims=2)
+
+embedding <- as.data.frame(tsne_out$Y)
+embedding$Class <- (indata$quartile )
+
+
+g <- ggplot(embedding, 
+            aes(x=V1, y=V2, color=Class), label = colnames(assay(indata,assay_type))) + geom_point(size=1.5) + xlab("T-SNE 1") + ylab("T-SNE 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("TSNE Plot") 
+
+plot(g)
+
+```
+
+## UMAP
+```{r, echo=FALSE}
+assay_type = "log_cpm"
+
+set.seed(1)
+umap_out <- umap(t(assay(indata,assay_type)))
+
+embedding <- as.data.frame(umap_out$layout)
+embedding$Class <- as.factor(indata$quartile)
+
+g <- ggplot(embedding, aes(x=V1, y=V2, color=Class, label = colnames(assay(indata,assay_type)))) + geom_point(size=1.5) + xlab("UMAP 1") + ylab("UMAP 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("UMAP Plot")
+
+plot(g)
+```
+
+#Dimension Reduction TCGA_young {.tabset}
+## PCA
+```{r}
+indata <- tcga_young
+
+plotPCA( DESeqTransform(indata), intgroup = "quartile")
+```
+
+## tSNE
+```{r}
+assay_type = "log_cpm"
+
+
+set.seed(1)
+tsne_out <- Rtsne(t(assay(indata,assay_type)), check_duplicates = FALSE, pca = TRUE, perplexity=10, theta=0.5, dims=2)
+
+embedding <- as.data.frame(tsne_out$Y)
+embedding$Class <- (indata$quartile )
+
+
+g <- ggplot(embedding, 
+            aes(x=V1, y=V2, color=Class), label = colnames(assay(indata,assay_type))) + geom_point(size=1.5) + xlab("T-SNE 1") + ylab("T-SNE 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("TSNE Plot") 
+
+plot(g)
+
+```
+
+## UMAP
+```{r, echo=FALSE}
+assay_type = "log_cpm"
+
+set.seed(1)
+umap_out <- umap(t(assay(indata,assay_type)))
+
+embedding <- as.data.frame(umap_out$layout)
+embedding$Class <- as.factor(indata$quartile)
+
+g <- ggplot(embedding, aes(x=V1, y=V2, color=Class, label = colnames(assay(indata,assay_type)))) + geom_point(size=1.5) + xlab("UMAP 1") + ylab("UMAP 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("UMAP Plot")
+
+plot(g)
+```
+#Dimension Reduction TCGA_old {.tabset}
+## PCA
+```{r}
+indata <- tcga_old
+
+plotPCA( DESeqTransform(indata), intgroup = "quartile")
+```
+
+## tSNE
+```{r}
+assay_type = "log_cpm"
+#indata <- dkfz_se
+
+set.seed(1)
+tsne_out <- Rtsne(t(assay(indata,assay_type)), check_duplicates = FALSE, pca = TRUE, perplexity=10, theta=0.5, dims=2)
+
+embedding <- as.data.frame(tsne_out$Y)
+embedding$Class <- (indata$quartile )
+
+
+g <- ggplot(embedding, 
+            aes(x=V1, y=V2, color=Class), label = colnames(assay(indata,assay_type))) + geom_point(size=1.5) + xlab("T-SNE 1") + ylab("T-SNE 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("TSNE Plot") 
+
+plot(g)
+
+```
+
+## UMAP
+```{r, echo=FALSE}
+assay_type = "log_cpm"
+
+set.seed(1)
+umap_out <- umap(t(assay(indata,assay_type)))
+
+embedding <- as.data.frame(umap_out$layout)
+embedding$Class <- as.factor(indata$quartile)
+
+g <- ggplot(embedding, aes(x=V1, y=V2, color=Class, label = colnames(assay(indata,assay_type)))) + geom_point(size=1.5) + xlab("UMAP 1") + ylab("UMAP 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("UMAP Plot")
+
+plot(g)
+```
+#Dimension Reduction SU2C {.tabset}
+## PCA
+```{r}
+indata <- su2c_2015
+
+plotPCA( DESeqTransform(indata), intgroup = "quartile")
+```
+
+## tSNE
+```{r}
+assay_type = "log_cpm"
+#indata <- dkfz_se
+
+set.seed(1)
+tsne_out <- Rtsne(t(assay(indata,assay_type)), check_duplicates = FALSE, pca = TRUE, perplexity=10, theta=0.5, dims=2)
+
+embedding <- as.data.frame(tsne_out$Y)
+embedding$Class <- (indata$quartile )
+
+
+g <- ggplot(embedding, 
+            aes(x=V1, y=V2, color=Class), label = colnames(assay(indata,assay_type))) + geom_point(size=1.5) + xlab("T-SNE 1") + ylab("T-SNE 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("TSNE Plot") 
+
+plot(g)
+
+```
+
+## UMAP
+```{r, echo=FALSE}
+assay_type = "log_cpm"
+
+set.seed(1)
+umap_out <- umap(t(assay(indata,assay_type)))
+
+embedding <- as.data.frame(umap_out$layout)
+embedding$Class <- as.factor(indata$quartile)
+
+g <- ggplot(embedding, aes(x=V1, y=V2, color=Class, label = colnames(assay(indata,assay_type)))) + geom_point(size=1.5) + xlab("UMAP 1") + ylab("UMAP 2") + theme(plot.title = element_text(hjust = 0.5)) + 
+ggtitle("UMAP Plot")
+
+plot(g)
+```
+<!-- #Dimension Reduction SU2C_young {.tabset} -->
+<!-- ## PCA -->
+<!-- ```{r} -->
+<!-- indata <- su2c_young -->
+
+<!-- plotPCA( DESeqTransform(indata), intgroup = "quartile") -->
+<!-- ``` -->
+
+<!-- ## tSNE -->
+<!-- ```{r} -->
+<!-- assay_type = "log_cpm" -->
+<!-- #indata <- dkfz_se -->
+
+<!-- set.seed(1) -->
+<!-- tsne_out <- Rtsne(t(assay(indata,assay_type)), check_duplicates = FALSE, pca = TRUE, perplexity=10, theta=0.5, dims=2) -->
+
+<!-- embedding <- as.data.frame(tsne_out$Y) -->
+<!-- embedding$Class <- (indata$quartile ) -->
+
+
+<!-- g <- ggplot(embedding,  -->
+<!--             aes(x=V1, y=V2, color=Class), label = colnames(assay(indata,assay_type))) + geom_point(size=1.5) + xlab("T-SNE 1") + ylab("T-SNE 2") + theme(plot.title = element_text(hjust = 0.5)) +  -->
+<!-- ggtitle("TSNE Plot")  -->
+
+<!-- plot(g) -->
+
+<!-- ``` -->
+
+<!-- ## UMAP -->
+<!-- ```{r, echo=FALSE} -->
+<!-- assay_type = "log_cpm" -->
+
+<!-- set.seed(1) -->
+<!-- umap_out <- umap(t(assay(indata,assay_type))) -->
+
+<!-- embedding <- as.data.frame(umap_out$layout) -->
+<!-- embedding$Class <- as.factor(indata$quartile) -->
+
+<!-- g <- ggplot(embedding, aes(x=V1, y=V2, color=Class, label = colnames(assay(indata,assay_type)))) + geom_point(size=1.5) + xlab("UMAP 1") + ylab("UMAP 2") + theme(plot.title = element_text(hjust = 0.5)) +  -->
+<!-- ggtitle("UMAP Plot") -->
+
+<!-- plot(g) -->
+<!-- ``` -->
+
+# Session Info
+```{r session info}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
